@@ -190,7 +190,12 @@ class ModelSlimConfig(QuantizationConfig):
         elif isinstance(layer, FusedMoE):
             moe_schemes = self.get_moe_scheme(layer, prefix)
             if moe_schemes is None:
-                raise ValueError(f"No ModelSlim MoE scheme found for layer {prefix}")
+                logger.warning(
+                    "ModelSlim MoE scheme unavailable for layer %s; "
+                    "falling back to unquantized FusedMoE.",
+                    prefix,
+                )
+                return None
             layer.w13_scheme, layer.w2_scheme = moe_schemes
             layer.w13_kernel, layer.w2_kernel = (
                 layer.w13_scheme.kernel,
@@ -198,6 +203,16 @@ class ModelSlimConfig(QuantizationConfig):
             )
             return ModelSlimFusedMoEMethod(self)
         return None
+
+    @staticmethod
+    def _candidate_moe_prefixes(prefix: str) -> List[str]:
+        prefixes = [prefix]
+        if prefix.startswith("model."):
+            prefixes.append(prefix[len("model.") :])
+        else:
+            prefixes.append("model." + prefix)
+        # preserve order while removing duplicates
+        return list(dict.fromkeys(prefixes))
 
     def get_linear_scheme(
         self, layer: torch.nn.Module, prefix: Optional[str] = None
@@ -250,50 +265,92 @@ class ModelSlimConfig(QuantizationConfig):
 
         w13_scheme_name = None
         w2_scheme_name = None
-        for gate_name, up_name, down_name in naming_conventions:
-            w13_keys = [
-                f"{prefix}.0.{gate_name}.weight",
-                f"{prefix}.0.{up_name}.weight",
-            ]
-            w2_key = f"{prefix}.0.{down_name}.weight"
-            w13_entries = {
-                key: self.quant_description[key]
-                for key in w13_keys
-                if key in self.quant_description
-            }
-            if w13_entries and w2_key in self.quant_description:
-                w13_names = list(w13_entries.values())
-                # For w13, both projections must agree on the scheme
+        saw_incomplete = False
+        incomplete_reason = ""
+
+        for prefix_candidate in self._candidate_moe_prefixes(prefix):
+            for gate_name, up_name, down_name in naming_conventions:
+                gate_key = f"{prefix_candidate}.0.{gate_name}.weight"
+                up_key = f"{prefix_candidate}.0.{up_name}.weight"
+                down_key = f"{prefix_candidate}.0.{down_name}.weight"
+
+                gate_exists = gate_key in self.quant_description
+                up_exists = up_key in self.quant_description
+                down_exists = down_key in self.quant_description
+                num_found = int(gate_exists) + int(up_exists) + int(down_exists)
+                if num_found == 0:
+                    continue
+
+                # Partial descriptions (e.g. FLOAT + missing) should gracefully
+                # fall back to unquantized FusedMoE rather than fail hard.
+                if num_found < 3:
+                    saw_incomplete = True
+                    incomplete_reason = (
+                        f"incomplete keys for {prefix_candidate} ({gate_name}/{up_name}/{down_name}): "
+                        f"gate={'found' if gate_exists else 'missing'}, "
+                        f"up={'found' if up_exists else 'missing'}, "
+                        f"down={'found' if down_exists else 'missing'}"
+                    )
+                    continue
+
+                w13_names = [
+                    self.quant_description.get(gate_key, ""),
+                    self.quant_description.get(up_key, ""),
+                ]
                 unique_w13 = set(w13_names)
                 if len(unique_w13) > 1:
                     raise ValueError(
                         f"Mismatched ModelSlim quantization for W13 in layer {prefix}: "
-                        f"{w13_entries}"
+                        f"{{'{gate_key}': '{w13_names[0]}', '{up_key}': '{w13_names[1]}'}}"
                     )
                 w13_scheme_name = w13_names[0]
-                w2_scheme_name = self.quant_description[w2_key]
+                w2_scheme_name = self.quant_description.get(down_key, "")
+                break
+            if w13_scheme_name is not None:
                 break
 
         if w13_scheme_name is None:
+            if saw_incomplete:
+                logger.warning(
+                    "Unsupported FusedMoe modelslim scheme in layer %s: %s; "
+                    "falling back to unquantized FusedMoE.",
+                    prefix,
+                    incomplete_reason,
+                )
+                return None
             # Build a helpful error message listing all attempted key patterns
             all_attempted = []
-            for gate_name, up_name, down_name in naming_conventions:
-                w13_keys = [
-                    f"{prefix}.0.{gate_name}.weight",
-                    f"{prefix}.0.{up_name}.weight",
-                ]
-                w2_key = f"{prefix}.0.{down_name}.weight"
-                w13_found = any(k in self.quant_description for k in w13_keys)
-                w2_found = w2_key in self.quant_description
-                status = (
-                    f"({gate_name}/{up_name}={'found' if w13_found else 'missing'}, "
-                    f"{down_name}={'found' if w2_found else 'missing'})"
-                )
-                all_attempted.append(status)
+            for prefix_candidate in self._candidate_moe_prefixes(prefix):
+                for gate_name, up_name, down_name in naming_conventions:
+                    w13_keys = [
+                        f"{prefix_candidate}.0.{gate_name}.weight",
+                        f"{prefix_candidate}.0.{up_name}.weight",
+                    ]
+                    w2_key = f"{prefix_candidate}.0.{down_name}.weight"
+                    w13_found = any(k in self.quant_description for k in w13_keys)
+                    w2_found = w2_key in self.quant_description
+                    status = (
+                        f"{prefix_candidate}({gate_name}/{up_name}={'found' if w13_found else 'missing'}, "
+                        f"{down_name}={'found' if w2_found else 'missing'})"
+                    )
+                    all_attempted.append(status)
             raise ValueError(
                 f"Missing ModelSlim MoE quantization description for layer {prefix}: "
                 + "; ".join(all_attempted)
             )
+
+        if (
+            w13_scheme_name in ("", "FLOAT")
+            or w2_scheme_name in ("", "FLOAT")
+            or w13_scheme_name != w2_scheme_name
+        ):
+            logger.warning(
+                "Unsupported FusedMoe modelslim scheme: %s in layer: %s; "
+                "falling back to unquantized FusedMoE.",
+                [w13_scheme_name, w2_scheme_name],
+                prefix,
+            )
+            return None
 
         # Map scheme names to classes
         scheme_map = dict(
