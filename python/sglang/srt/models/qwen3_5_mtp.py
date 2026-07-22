@@ -40,6 +40,35 @@ from sglang.srt.utils import add_prefix, is_npu
 logger = logging.getLogger(__name__)
 
 
+def _has_incomplete_modelslim_mtp_moe_config(quant_description) -> bool:
+    if not isinstance(quant_description, dict):
+        return False
+
+    naming_conventions = [
+        ("gate_proj", "up_proj", "down_proj"),
+        ("w1", "w3", "w2"),
+    ]
+    prefixes = ("mtp.layers.0.mlp.experts", "model.mtp.layers.0.mlp.experts")
+
+    for prefix in prefixes:
+        for gate_name, up_name, down_name in naming_conventions:
+            keys = [
+                f"{prefix}.0.{gate_name}.weight",
+                f"{prefix}.0.{up_name}.weight",
+                f"{prefix}.0.{down_name}.weight",
+            ]
+            found = [key in quant_description for key in keys]
+            found_count = sum(found)
+            if found_count == 0:
+                continue
+            if found_count < 3:
+                return True
+            values = [quant_description.get(key, "") for key in keys]
+            if any(value in ("", None) for value in values):
+                return True
+    return False
+
+
 class Qwen3_5ForCausalLMMTP(nn.Module):
 
     def __init__(
@@ -77,6 +106,18 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 for layer in exclude_layers
             ):
                 quant_config = None
+        if (
+            quant_config
+            and quant_config.get_name() == "modelslim"
+            and _has_incomplete_modelslim_mtp_moe_config(
+                getattr(quant_config, "quant_description", None)
+            )
+        ):
+            logger.warning(
+                "Detected incomplete ModelSlim MTP MoE quantization config; "
+                "disabling draft quantization for Qwen3.5 MTP branch."
+            )
+            quant_config = None
 
         self.config = config
         self.tp_size = get_parallel().tp_size
