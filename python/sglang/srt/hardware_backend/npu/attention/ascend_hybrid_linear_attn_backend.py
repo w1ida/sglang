@@ -218,6 +218,47 @@ class AscendMamba2AttnBackend(AscendMambaAttnBackendBase):
 
 
 class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
+    # Ascend 910B has limited UB capacity. The external NPU Triton
+    # move_intermediate_cache kernel stages one whole SSM row per program; when
+    # quantization leaves enough memory for a larger MTP batch, the unquantized
+    # MTP model can expose a row that overflows UB during BishengIR compilation.
+    # Use the Torch fallback for rows at/above this conservative footprint until
+    # sgl_kernel_npu tiles the Triton copy along the hidden/state dimension.
+    _TRITON_MOVE_CACHE_MAX_ROW_BYTES = 128 * 1024
+
+    @classmethod
+    def _should_use_torch_ssm_scatter(
+        cls, intermediate_state_cache: torch.Tensor
+    ) -> bool:
+        row_numel = intermediate_state_cache[0, 0, 0].numel()
+        row_bytes = row_numel * intermediate_state_cache.element_size()
+        return row_bytes >= cls._TRITON_MOVE_CACHE_MAX_ROW_BYTES
+
+    @staticmethod
+    def _scatter_intermediate_cache_with_torch(
+        ssm_states: torch.Tensor,
+        intermediate_state_cache: torch.Tensor,
+        dst_indices: torch.Tensor,
+        src_indices: torch.Tensor,
+        step_indices: torch.Tensor,
+    ) -> None:
+        """Torch fallback for Ascend Triton move_intermediate_cache.
+
+        This keeps the same gather/scatter semantics as the Triton cache-move
+        kernel, but avoids staging an oversized SSM row in UB when the external
+        kernel's h-block is too large for the current MTP verify shape.
+        """
+        valid_mask = step_indices >= 0
+        if not valid_mask.any().item():
+            return
+
+        valid_dst = dst_indices[valid_mask]
+        valid_src = src_indices[valid_mask]
+        valid_steps = step_indices[valid_mask]
+        ssm_states[:, valid_dst] = intermediate_state_cache[
+            :, valid_src, valid_steps
+        ]
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
@@ -233,14 +274,12 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
     ):
-        """
-        Update mamba states after MTP verify using fully fused Triton kernel.
+        """Update mamba states after MTP verify on Ascend.
 
-        This replaces the original advanced indexing operations with a single fused
-        gather-scatter kernel that also handles masking internally, avoiding:
-        - index_elementwise_kernel from tensor[bool_mask]
-        - index_select kernel launches
-        - nonzero kernel launches
+        The NPU Triton cache-move kernel is kept for shapes that fit in UB.
+        Oversized SSM rows fall back to an equivalent Torch indexed scatter until
+        the external sgl_kernel_npu kernel tiles the copy along the state
+        dimension.
         """
         request_number = last_correct_step_indices.shape[0]
 
@@ -264,6 +303,9 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             dtype=torch.int64,
         )
         last_steps = last_correct_step_indices.to(torch.int64)  # [N]
+        use_torch_ssm_scatter = self._should_use_torch_ssm_scatter(
+            intermediate_state_cache
+        )
 
         # NPU: skip intermediate_ssm copy when accept_lens == 1.
         # The state at step 0 is the just-computed recurrent state, which
@@ -274,13 +316,22 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         # garbage output.
         all_step0 = (last_steps == 0).all().item()
         if not all_step0:
-            move_intermediate_cache(
-                ssm_states,
-                intermediate_state_cache,
-                dst_indices_tensor,
-                src_indices_tensor,
-                last_steps,
-            )
+            if use_torch_ssm_scatter:
+                self._scatter_intermediate_cache_with_torch(
+                    ssm_states,
+                    intermediate_state_cache,
+                    dst_indices_tensor,
+                    src_indices_tensor,
+                    last_steps,
+                )
+            else:
+                move_intermediate_cache(
+                    ssm_states,
+                    intermediate_state_cache,
+                    dst_indices_tensor,
+                    src_indices_tensor,
+                    last_steps,
+                )
 
         draft_token_num = intermediate_state_cache.shape[2]
         if mamba_track_indices is not None:
@@ -288,13 +339,22 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             mamba_track_indices = mamba_track_indices.to(torch.int64)
             mamba_steps_to_track = mamba_steps_to_track.to(torch.int64)
 
-            move_intermediate_cache(
-                ssm_states,
-                intermediate_state_cache,
-                mamba_track_indices,
-                src_indices_tensor,
-                mamba_steps_to_track,
-            )
+            if use_torch_ssm_scatter:
+                self._scatter_intermediate_cache_with_torch(
+                    ssm_states,
+                    intermediate_state_cache,
+                    mamba_track_indices,
+                    src_indices_tensor,
+                    mamba_steps_to_track,
+                )
+            else:
+                move_intermediate_cache(
+                    ssm_states,
+                    intermediate_state_cache,
+                    mamba_track_indices,
+                    src_indices_tensor,
+                    mamba_steps_to_track,
+                )
 
             track_mask = mamba_steps_to_track >= 0
             # Track conv state from the verify-time window before rolling back
