@@ -190,7 +190,7 @@ class ModelSlimConfig(QuantizationConfig):
         elif isinstance(layer, FusedMoE):
             moe_schemes = self.get_moe_scheme(layer, prefix)
             if moe_schemes is None:
-                raise ValueError(f"No ModelSlim MoE scheme found for layer {prefix}")
+                return None
             layer.w13_scheme, layer.w2_scheme = moe_schemes
             layer.w13_kernel, layer.w2_kernel = (
                 layer.w13_scheme.kernel,
@@ -302,6 +302,8 @@ class ModelSlimConfig(QuantizationConfig):
 
         # Instantiate the schemes
         def instantiate(name, weight_group):
+            if name == "FLOAT":
+                return None
             cls = scheme_map.get(name)
             if cls is None:
                 logger.warning(f"Unsupported scheme '{name}' for layer {prefix}")
@@ -311,10 +313,11 @@ class ModelSlimConfig(QuantizationConfig):
         w13_scheme = instantiate(w13_scheme_name, weight_group="w13")
         w2_scheme = instantiate(w2_scheme_name, weight_group="w2")
         if w13_scheme is None or w2_scheme is None:
-            raise ValueError(
-                f"Unsupported ModelSlim MoE schemes for layer {prefix}: "
+            logger.warning(
+                f"No ModelSlim MoE scheme for layer {prefix}: "
                 f"W13='{w13_scheme_name}', W2='{w2_scheme_name}'"
             )
+            return None
         logger.info_once(f"Using {type(w13_scheme).__name__} for W13")
         logger.info_once(f"Using {type(w2_scheme).__name__} for W2")
 
